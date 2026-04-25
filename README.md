@@ -4,9 +4,12 @@ a novel framework CCD-GFSOD, to reduce novel classes feature instability and all
 
 
 
-Quick Start
+# Quick Start
+
 1. Check Requirements
 Linux with Python >= 3.6
 PyTorch >= 1.6 & torchvision that matches the PyTorch version.
 CUDA 10.1, 10.2
 GCC >= 4.9
+
+2. Build DeFRCN
