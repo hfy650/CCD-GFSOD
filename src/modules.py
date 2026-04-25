@@ -1,296 +1,161 @@
-import logging
-
+# refine
 import torch
-from detectron2.modeling.backbone import build_backbone
-from detectron2.modeling.postprocessing import detector_postprocess
-from detectron2.modeling.proposal_generator import build_proposal_generator
-from detectron2.structures import ImageList
-from detectron2.utils.logger import log_first_n
 from torch import nn
-
-from fsdet.modeling.roi_heads import build_roi_heads
-
-# avoid conflicting with the existing GeneralizedRCNN module in Detectron2
-from .build import META_ARCH_REGISTRY
-
-#加了一个这个
-from .refine import Refine
+from torch.nn import functional as F
+from detectron2.modeling.poolers import ROIPooler
+from detectron2.utils import comm, events
+from einops import reduce
+from torch import distributed as dist
 
 
-__all__ = ["GeneralizedRCNN", "ProposalNetwork"]
-
-
-@META_ARCH_REGISTRY.register()
-class GeneralizedRCNN(nn.Module):
-    """
-    Generalized R-CNN. Any models that contains the following three components:
-    1. Per-image feature extraction (aka backbone)
-    2. Region proposal generation
-    3. Per-region feature extraction and prediction
-    """
-
-    def __init__(self, cfg):
+class Refine(nn.Module):
+    def __init__(self, input_shapes, num_classes, momentum=0.5, warmup_iters=0, eps=1e-12):
+        """
+        Adapted for single-level backbone feature (e.g. features['res4']).
+        Args:
+            input_shapes: dict, expected to contain single key 'res4': ShapeSpec
+            num_classes: number of classes (int)
+        """
         super().__init__()
+        self.momentum = momentum
+        self.num_classes = num_classes
+        self.warmup_iters = warmup_iters
+        self.eps = eps
 
-        self.device = torch.device(cfg.MODEL.DEVICE)
-        self.backbone = build_backbone(cfg)
-        self.proposal_generator = build_proposal_generator(
-            cfg, self.backbone.output_shape()
-        )
-        #加的
-        self.roi_heads = build_roi_heads(cfg, self.backbone.output_shape())
-        self.refine = Refine(
-            self.backbone.output_shape(),
-            num_classes=cfg.MODEL.REFINE.NUM_CLASSES,
-            momentum=cfg.MODEL.REFINE.MOMENTUM,
-            warmup_iters=cfg.MODEL.REFINE.WARMUP_ITERS,
-            eps=cfg.MODEL.REFINE.EPS,
-        )
-
-        #
-        assert len(cfg.MODEL.PIXEL_MEAN) == len(cfg.MODEL.PIXEL_STD)
-        num_channels = len(cfg.MODEL.PIXEL_MEAN)
-        pixel_mean = (
-            torch.Tensor(cfg.MODEL.PIXEL_MEAN)
-            .to(self.device)
-            .view(num_channels, 1, 1)
-        )
-        pixel_std = (
-            torch.Tensor(cfg.MODEL.PIXEL_STD)
-            .to(self.device)
-            .view(num_channels, 1, 1)
-        )
-        self.normalizer = lambda x: (x - pixel_mean) / pixel_std
-        self.to(self.device)
-
-        if cfg.MODEL.BACKBONE.FREEZE:
-            for p in self.backbone.parameters():
-                p.requires_grad = False
-            print("froze backbone parameters")
-
-        if cfg.MODEL.PROPOSAL_GENERATOR.FREEZE:
-            for p in self.proposal_generator.parameters():
-                p.requires_grad = False
-            print("froze proposal generator parameters")
-
-        if cfg.MODEL.ROI_HEADS.FREEZE_FEAT:
-            for p in self.roi_heads.box_head.parameters():
-                p.requires_grad = False
-            print("froze roi_box_head parameters")
-
-    def forward(self, batched_inputs):
-        """
-        Args:
-            batched_inputs: a list, batched outputs of :class:`DatasetMapper` .
-                Each item in the list contains the inputs for one image.
-                For now, each item in the list is a dict that contains:
-
-                * image: Tensor, image in (C, H, W) format.
-                * instances (optional): groundtruth :class:`Instances`
-                * proposals (optional): :class:`Instances`, precomputed proposals.
-
-                Other information that's included in the original dicts, such as:
-
-                * "height", "width" (int): the output resolution of the model, used in inference.
-                    See :meth:`postprocess` for details.
-
-        Returns:
-            list[dict]:
-                Each dict is the output for one input image.
-                The dict contains one key "instances" whose value is a :class:`Instances`.
-                The :class:`Instances` object has the following keys:
-                    "pred_boxes", "pred_classes", "scores"
-        """
-        if not self.training:
-            return self.inference(batched_inputs)
-
-        images = self.preprocess_image(batched_inputs)
-        if "instances" in batched_inputs[0]:
-            gt_instances = [
-                x["instances"].to(self.device) for x in batched_inputs
-            ]
-        elif "targets" in batched_inputs[0]:
-            log_first_n(
-                logging.WARN,
-                "'targets' in the model inputs is now renamed to 'instances'!",
-                n=10,
-            )
-            gt_instances = [
-                x["targets"].to(self.device) for x in batched_inputs
-            ]
-        else:
-            gt_instances = None
-        #加的
-        features = self.backbone(images.tensor)
-        features_refined = self.refine(features)
-
-        #改了
-        if self.proposal_generator:
-            proposals, proposal_losses = self.proposal_generator(
-                images,
-                {k: v.detach() for k, v in features_refined.items()},#用较准后的每层特征来做计算损失
-                gt_instances
-            )
-        else:
-            assert "proposals" in batched_inputs[0]
-            proposals = [
-                x["proposals"].to(self.device) for x in batched_inputs
-            ]
-            proposal_losses = {}
-
-        #加的
-        proposals = self.roi_heads.label_and_sample_proposals(proposals, gt_instances)
-        pooled_features = self.roi_heads.box_pooler(
-            [features[f] for f in ["p2", "p3", "p4", "p5"]],  # 多层特征
-            [x.proposal_boxes for x in proposals]  # proposals 坐标
-        )
-        # 送入 refine 更新质心
-        self.refine.update_centroids(pooled_features, proposals)
-        #改的
-        _, detector_losses = self.roi_heads(features_refined, proposals)
-        losses = {}
-        losses.update(detector_losses)
-        losses.update(proposal_losses)
-        return losses
-
-
-
-
-    def inference(
-        self, batched_inputs, detected_instances=None, do_postprocess=True
-    ):
-        """
-        Run inference on the given inputs.
-
-        Args:
-            batched_inputs (list[dict]): same as in :meth:`forward`
-            detected_instances (None or list[Instances]): if not None, it
-                contains an `Instances` object per image. The `Instances`
-                object contains "pred_boxes" and "pred_classes" which are
-                known boxes in the image.
-                The inference will then skip the detection of bounding boxes,
-                and only predict other per-ROI outputs.
-            do_postprocess (bool): whether to apply post-processing on the outputs.
-
-        Returns:
-            same as in :meth:`forward`.
-        """
-        assert not self.training
-
-        images = self.preprocess_image(batched_inputs)
-        features = self.backbone(images.tensor)
-        #加的
-        features_refined = self.refine(features)
-        if detected_instances is None:
-            if self.proposal_generator:
-                proposals, _ = self.proposal_generator(images, features_refined, None)#改了
+        # 只为 res4 建一个 1x1 conv（如果 input_shapes 里只有一个 level，这里会处理）
+        # 用 ModuleDict 保持接口一致
+        self.fcs = nn.ModuleDict()
+        for lvl, shape in input_shapes.items():
+            fc = nn.Conv2d(shape.channels, shape.channels, kernel_size=1, stride=1, padding=0, bias=True)
+            # 初始化为 identity-like：当 in==out 时设为单位矩阵每个通道自带通道映射
+            if shape.channels == shape.channels:
+                # conv weight shape: (out_channels, in_channels, 1, 1)
+                eye = torch.eye(shape.channels).reshape(shape.channels, shape.channels, 1, 1)
+                with torch.no_grad():
+                    fc.weight.copy_(eye)
             else:
-                assert "proposals" in batched_inputs[0]
-                proposals = [
-                    x["proposals"].to(self.device) for x in batched_inputs
-                ]
+                nn.init.kaiming_normal_(fc.weight)
+            nn.init.zeros_(fc.bias)
+            self.fcs[lvl] = fc
 
-            results, _ = self.roi_heads(features_refined, proposals)#改了
+        # ROI Pooler：因为只有一层特征，scales 是单元素列表
+        # 注意： scales 的值应为 1.0/stride（ShapeSpec 中的 stride）
+        self.pooler = ROIPooler(
+            output_size=(1, 1),
+            scales=[1.0 / s.stride for s in input_shapes.values()],
+            sampling_ratio=0,
+            pooler_type="ROIAlignV2",
+        )
+
+        # 全局质心：shape (num_classes, dim)
+        dim = list(input_shapes.values())[0].channels
+        self.register_buffer("centroids", torch.zeros(num_classes, dim) + eps)
+
+    @property
+    def iterations(self):
+        if not hasattr(self, "storage"):
+            self.storage = events.get_event_storage()
+        return self.storage.iter
+
+    @torch.no_grad()
+    def update_centroids(self, features: dict, proposals):
+        """
+        单层版本的多样本质心更新。
+        features: dict, e.g. {'res4': Tensor(B, C, H, W)}
+        proposals: list[Instances]（每个 Instances 含 gt_boxes）
+        """
+        if self.momentum == 0 or self.iterations < self.warmup_iters:
+            return
+
+        # 只取单层特征（确保顺序与 pooler scales 对应）
+        features_list = [features[lvl] for lvl in sorted(features.keys())]
+
+        # gt_boxes 列表（每张图的 gt_boxes）
+        gt_boxes = [x.gt_boxes for x in proposals]
+
+        # ROIAlign -> (sum_all_gt, C, 1, 1)
+        pooled = self.pooler(features_list, gt_boxes)  # (N, C, 1, 1)
+        pooled = pooled.flatten(start_dim=1)  # (N, C)
+
+        if pooled.numel() == 0:
+            return  # 没有 GT 时直接返回
+
+        # 归一化后与当前全局质心计算相似度，选择最相似的类作为归属
+        sims = F.normalize(F.dropout(pooled, p=0.5, training=self.training), dim=1).matmul(
+            F.normalize(self.centroids, dim=1).T
+        )  # (N, num_classes)
+
+        # 为每个 pooled 向量分配一个类别：one-hot mask (N, num_classes)
+        mask = torch.zeros_like(sims).scatter(1, sims.argmax(dim=1, keepdim=True), 1.0)
+
+        # 累加每个类的特征和计数
+        # sum_x: (num_classes, C)
+        sum_x = mask.T.matmul(pooled)
+        # count: (num_classes, 1)
+        count = mask.sum(dim=0).unsqueeze(1)
+
+        # 跨进程聚合（如果使用分布式训练）
+        world_size = comm.get_world_size()
+        if world_size > 1:
+            # 收集并相加所有进程的结果
+            sum_x_gather = [torch.empty_like(sum_x) for _ in range(world_size)]
+            count_gather = [torch.empty_like(count) for _ in range(world_size)]
+            dist.all_gather(sum_x_gather, sum_x)
+            dist.all_gather(count_gather, count)
+            sum_x_gt = torch.stack(sum_x_gather, dim=0).sum(dim=0)
+            count_gt = torch.stack(count_gather, dim=0).sum(dim=0)
         else:
-            detected_instances = [
-                x.to(self.device) for x in detected_instances
-            ]
-            #改了
-            results = self.roi_heads.forward_with_given_boxes(
-                features_refined, detected_instances
+            sum_x_gt = sum_x
+            count_gt = count
+
+        # 计算新的类中心（保护除以 0）
+        centroids_new = sum_x_gt / count_gt.clamp_min(1)
+
+        # 只有 count>0 的类才参与动量更新
+        alpha = (count_gt > 0).float() * self.momentum  # (num_classes, 1)
+        # 广播 alpha 以匹配 centroids shape (num_classes, C)
+        alpha = alpha.expand_as(centroids_new)
+
+        # 指数移动平均地更新全局质心（in-place）
+        updated = (1 - alpha) * self.centroids + alpha * centroids_new
+        self.centroids.copy_(updated)
+
+    def forward(self, features: dict):
+        """
+        对单层特征（res4）做空间分区校准并返回同样的 dict 结构。
+        """
+        outputs = {}
+        for lvl, x in features.items():  # 这里只有一个 lvl: 'res4'
+            if self.training and self.iterations < self.warmup_iters:
+                outputs[lvl] = F.relu(self.fcs[lvl](x))
+                continue
+
+            # sim: (B, num_classes, H, W)
+            sim = torch.einsum(
+                "bchw,nc->bnhw",
+                F.normalize(x, dim=1),
+                F.normalize(self.centroids, dim=1),
             )
-            #
-        if do_postprocess:
-            processed_results = []
-            for results_per_image, input_per_image, image_size in zip(
-                results, batched_inputs, images.image_sizes
-            ):
-                height = input_per_image.get("height", image_size[0])
-                width = input_per_image.get("width", image_size[1])
-                r = detector_postprocess(results_per_image, height, width)
-                processed_results.append({"instances": r})
-            return processed_results
-        else:
-            return results
 
-    def preprocess_image(self, batched_inputs):
-        """
-        Normalize, pad and batch the input images.
-        """
-        images = [x["image"].to(self.device) for x in batched_inputs]
-        images = [self.normalizer(x) for x in images]
-        images = ImageList.from_tensors(
-            images, self.backbone.size_divisibility
-        )
-        return images
+            # 为每个空间位置分配最相似的全局质心
+            mask = torch.zeros_like(sim).scatter(1, sim.argmax(dim=1, keepdim=True), 1.0)  # (B, N, H, W)
 
+            # 聚合分区内的特征总和 -> (B, N, C)
+            sum_x = torch.einsum("bnhw,bchw->bnc", mask, x)
 
-@META_ARCH_REGISTRY.register()
-class ProposalNetwork(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.device = torch.device(cfg.MODEL.DEVICE)
+            # 统计每个分区的元素个数 -> (B, N, 1)
+            count = reduce(mask, "b n h w -> b n ()", "sum")
 
-        self.backbone = build_backbone(cfg)
-        self.proposal_generator = build_proposal_generator(
-            cfg, self.backbone.output_shape()
-        )
+            # 临时分区质心 (B, N, C)
+            centroids_local = sum_x / count.clamp_min(1)
 
-        pixel_mean = (
-            torch.Tensor(cfg.MODEL.PIXEL_MEAN).to(self.device).view(-1, 1, 1)
-        )
-        pixel_std = (
-            torch.Tensor(cfg.MODEL.PIXEL_STD).to(self.device).view(-1, 1, 1)
-        )
-        self.normalizer = lambda x: (x - pixel_mean) / pixel_std
-        self.to(self.device)
+            # 重构分区质心到空间位置并与原始特征比较
+            delta = torch.einsum("bnhw,bnc->bchw", mask, centroids_local) - x  # (B, C, H, W)
 
-    def forward(self, batched_inputs):
-        """
-        Args:
-            Same as in :class:`GeneralizedRCNN.forward`
+            # alpha: 相似度自适应系数 (B, 1, H, W)
+            alpha = torch.exp(-delta.square().mean(dim=1, keepdim=True))
 
-        Returns:
-            list[dict]: Each dict is the output for one input image.
-                The dict contains one key "proposals" whose value is a
-                :class:`Instances` with keys "proposal_boxes" and "objectness_logits".
-        """
-        images = [x["image"].to(self.device) for x in batched_inputs]
-        images = [self.normalizer(x) for x in images]
-        images = ImageList.from_tensors(
-            images, self.backbone.size_divisibility
-        )
-        features = self.backbone(images.tensor)
+            # 校准特征并通过 1x1 conv
+            outputs[lvl] = F.relu(self.fcs[lvl](x + alpha * delta))
 
-        if "instances" in batched_inputs[0]:
-            gt_instances = [
-                x["instances"].to(self.device) for x in batched_inputs
-            ]
-        elif "targets" in batched_inputs[0]:
-            log_first_n(
-                logging.WARN,
-                "'targets' in the model inputs is now renamed to 'instances'!",
-                n=10,
-            )
-            gt_instances = [
-                x["targets"].to(self.device) for x in batched_inputs
-            ]
-        else:
-            gt_instances = None
-        proposals, proposal_losses = self.proposal_generator(
-            images, features, gt_instances
-        )
-        # In training, the proposals are not useful at all but we generate them anyway.
-        # This makes RPN-only models about 5% slower.
-        if self.training:
-            return proposal_losses
-
-        processed_results = []
-        for results_per_image, input_per_image, image_size in zip(
-            proposals, batched_inputs, images.image_sizes
-        ):
-            height = input_per_image.get("height", image_size[0])
-            width = input_per_image.get("width", image_size[1])
-            r = detector_postprocess(results_per_image, height, width)
-            processed_results.append({"proposals": r})
-        return processed_results
+        return outputs
